@@ -154,6 +154,14 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         updateRemoveAdminButton();
+        // 漏洞列表里提权成功后返回终端，自动接上 root shell
+        terminalView.syncRootShell();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        terminalView.shutdown();
     }
 
     private void updateRemoveAdminButton() {

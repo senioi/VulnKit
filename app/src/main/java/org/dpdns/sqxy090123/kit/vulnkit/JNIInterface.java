@@ -2,6 +2,8 @@ package org.dpdns.sqxy090123.kit.vulnkit;
 
 import android.util.Log;
 
+import java.nio.charset.StandardCharsets;
+
 public class JNIInterface {
     static {
         System.loadLibrary("vulnkit");
@@ -19,7 +21,7 @@ public class JNIInterface {
     public static native boolean cve202548572_setuidZero();
     public static native int startRootShell();
     public static native int writeRootShell(String cmd);
-    public static native String readRootShell();
+    public static native byte[] readRootShellBytes();
     public static native void closeRootShell();
     public static native boolean isRootShellAvailable();
     public static native boolean isHarmonyOS();
@@ -36,6 +38,16 @@ public class JNIInterface {
     public static native boolean cve202453104_exploit();
     public static native boolean cve20250088_exploit_bruteforce(long[] resultParams);
     public static native boolean cve20250088_exploit_with_params(long commit_creds, long prepare_kernel_cred, int offset);
+
+    /**
+     * 读取 root shell 输出，无输出时返回 null。
+     * 底层返回字节数组，这里按 UTF-8 解码，非法字节会被替换而不是让进程崩溃。
+     */
+    public static String readRootShell() {
+        byte[] data = readRootShellBytes();
+        if (data == null || data.length == 0) return null;
+        return new String(data, StandardCharsets.UTF_8);
+    }
 
     /**
      * 兼容旧调用，直接执行 CVE-2025-21479 漏洞（物理内存穷举）

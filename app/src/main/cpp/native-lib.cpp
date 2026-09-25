@@ -104,11 +104,17 @@ Java_org_dpdns_sqxy090123_kit_vulnkit_JNIInterface_writeRootShell(JNIEnv *env, j
     env->ReleaseStringUTFChars(cmd, c_cmd);
     return ret;
 }
-extern "C" JNIEXPORT jstring JNICALL
-Java_org_dpdns_sqxy090123_kit_vulnkit_JNIInterface_readRootShell(JNIEnv *env, jclass clazz) {
-    char *line = read_root_shell();
-    if (line) return env->NewStringUTF(line);
-    return nullptr;
+// 返回原始字节，由 Java 侧按 UTF-8 解码：NewStringUTF 遇到非法 modified UTF-8 会直接中止进程
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_dpdns_sqxy090123_kit_vulnkit_JNIInterface_readRootShellBytes(JNIEnv *env, jclass clazz) {
+    char *data = read_root_shell();
+    if (data == nullptr) return nullptr;
+    size_t len = strlen(data);
+    if (len == 0) return nullptr;
+    jbyteArray result = env->NewByteArray((jsize) len);
+    if (result == nullptr) return nullptr;
+    env->SetByteArrayRegion(result, 0, (jsize) len, reinterpret_cast<const jbyte *>(data));
+    return result;
 }
 extern "C" JNIEXPORT void JNICALL
 Java_org_dpdns_sqxy090123_kit_vulnkit_JNIInterface_closeRootShell(JNIEnv *env, jclass clazz) {

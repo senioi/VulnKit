@@ -4,7 +4,9 @@ import android.content.Context;
 import android.graphics.Color;
 import android.util.AttributeSet;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.inputmethod.EditorInfo;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -12,16 +14,26 @@ import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 
-public class TerminalView extends ScrollView {
+/**
+ * 主界面终端。普通 shell 走 Process 管道，root shell 走 JNI 管道。
+ * 所有读取都在后台线程，UI 线程只负责写入与显示。
+ */
+public class TerminalView extends LinearLayout {
+    private static final int ROOT_POLL_INTERVAL_MS = 50;
+
     private TextView outputView;
+    private ScrollView scrollView;
     private EditText inputEdit;
-    private LinearLayout container;
     private Process shellProcess;
     private DataOutputStream shellOutput;
-    private BufferedReader shellInput;
-    private boolean usingRootShell = false;
+
+    private volatile boolean usingRootShell = false;
+    private volatile boolean rootReaderRunning = false;
+    private volatile boolean shutDown = false;
 
     public TerminalView(Context context, AttributeSet attrs) {
         super(context, attrs);
@@ -29,168 +41,254 @@ public class TerminalView extends ScrollView {
     }
 
     private void init() {
+        setOrientation(VERTICAL);
         setBackgroundColor(Color.BLACK);
 
-        container = new LinearLayout(getContext());
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setLayoutParams(new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        addView(container);
+        scrollView = new ScrollView(getContext());
+        scrollView.setLayoutParams(new LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f));
+        addView(scrollView);
 
         outputView = new TextView(getContext());
         outputView.setTextColor(Color.GREEN);
         outputView.setTextSize(12);
         outputView.setPadding(16, 16, 16, 16);
-        outputView.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-        container.addView(outputView);
+        outputView.setTextIsSelectable(true);
+        scrollView.addView(outputView, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout inputRow = new LinearLayout(getContext());
+        inputRow.setOrientation(HORIZONTAL);
+        inputRow.setLayoutParams(new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        addView(inputRow);
 
         inputEdit = new EditText(getContext());
         inputEdit.setTextColor(Color.GREEN);
         inputEdit.setBackgroundColor(Color.BLACK);
         inputEdit.setHint("$ ");
         inputEdit.setHintTextColor(Color.DKGRAY);
-        inputEdit.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        inputEdit.setInputType(EditorInfo.TYPE_CLASS_TEXT);
+        inputEdit.setSingleLine(true);
+        inputEdit.setImeOptions(EditorInfo.IME_ACTION_SEND);
         inputEdit.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEND ||
-                    (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER && event.getAction() == KeyEvent.ACTION_DOWN)) {
-                executeCommand(v.getText().toString());
-                v.setText("");
+            boolean imeAction = actionId == EditorInfo.IME_ACTION_SEND
+                    || actionId == EditorInfo.IME_ACTION_DONE
+                    || actionId == EditorInfo.IME_ACTION_GO;
+            boolean enterKey = event != null
+                    && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                    && event.getAction() == KeyEvent.ACTION_DOWN;
+            if (imeAction || enterKey) {
+                submitInput();
                 return true;
             }
             return false;
         });
-        container.addView(inputEdit);
+        inputRow.addView(inputEdit, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
+
+        Button runButton = new Button(getContext());
+        runButton.setText("运行");
+        runButton.setTextColor(Color.GREEN);
+        runButton.setOnClickListener(v -> submitInput());
+        inputRow.addView(runButton, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+    }
+
+    private void submitInput() {
+        String cmd = inputEdit.getText().toString().trim();
+        inputEdit.setText("");
+        if (!cmd.isEmpty()) {
+            executeCommand(cmd);
+        }
     }
 
     public void startShell() {
+        if (shutDown) return;
         try {
-            shellProcess = Runtime.getRuntime().exec("sh");
+            ProcessBuilder builder = new ProcessBuilder("/system/bin/sh");
+            builder.redirectErrorStream(true);
+            shellProcess = builder.start();
             shellOutput = new DataOutputStream(shellProcess.getOutputStream());
-            shellInput = new BufferedReader(new InputStreamReader(shellProcess.getInputStream()));
-            BufferedReader shellError = new BufferedReader(new InputStreamReader(shellProcess.getErrorStream()));
+            final Process proc = shellProcess;
+            final BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(shellProcess.getInputStream(), StandardCharsets.UTF_8));
+            final long startTime = System.currentTimeMillis();
 
-            // 标准输出读取线程
             new Thread(() -> {
                 try {
-                    String line;
-                    while ((line = shellInput.readLine()) != null) {
-                        final String finalLine = line;
-                        post(() -> outputView.append(finalLine + "\n"));
+                    char[] buf = new char[4096];
+                    int n;
+                    while ((n = reader.read(buf)) > 0) {
+                        append(new String(buf, 0, n));
                     }
-                } catch (Exception e) {
-                    post(() -> outputView.append("读取输出异常: " + e.getMessage() + "\n"));
+                } catch (IOException ignored) {
+                    // shell 被关闭时正常出现
+                } finally {
+                    if (!shutDown && shellProcess == proc) {
+                        append("\n[shell 已退出]\n");
+                        usingRootShell = false;
+                        if (System.currentTimeMillis() - startTime > 1000) {
+                            startShell();
+                        }
+                    }
                 }
             }).start();
 
-            // 错误输出读取线程
-            new Thread(() -> {
-                try {
-                    String line;
-                    while ((line = shellError.readLine()) != null) {
-                        final String finalLine = line;
-                        post(() -> outputView.append("[ERR] " + finalLine + "\n"));
-                    }
-                } catch (Exception e) {
-                    // 忽略
-                }
-            }).start();
-        } catch (Exception e) {
-            outputView.append("启动 shell 失败: " + e.getMessage() + "\n");
+            append("VulnKit 终端已就绪，输入 help 查看内置命令。\n");
+        } catch (IOException e) {
+            append("启动 shell 失败: " + e.getMessage() + "\n");
         }
     }
 
     private void executeCommand(String cmd) {
+        if (cmd.equals("clear")) {
+            outputView.setText("");
+            return;
+        }
+
+        append((usingRootShell ? "# " : "$ ") + cmd + "\n");
+
+        if (cmd.equals("help")) {
+            append("内置命令:\n"
+                    + "  su              切换到 root shell（需已成功提权）\n"
+                    + "  runin root      同 su\n"
+                    + "  exituser        退出 root shell，回到普通 shell\n"
+                    + "  clear           清屏\n"
+                    + "其余输入直接交给当前 shell 执行。\n");
+            return;
+        }
         if (cmd.equals("su")) {
-            if (JNIInterface.isRootShellAvailable()) {
+            if (usingRootShell) {
+                append("已经是 root shell\n");
+            } else if (JNIInterface.isRootShellAvailable()) {
                 switchToRootShell();
             } else {
-                outputView.append("Root shell 不可用，请先利用提权漏洞\n");
+                append("root shell 不可用：请先在漏洞列表中成功执行一个提权漏洞\n");
             }
             return;
         }
         if (cmd.startsWith("runin ")) {
             String target = cmd.substring(6).trim();
-            if (target.equals("app")) {
-                outputView.append("切换到 App shell 的功能正在开发中\n");
-            } else if (target.equals("shell")) {
-                outputView.append("切换到 Shell shell 的功能正在开发中\n");
-            } else if (target.equals("system")) {
-                outputView.append("切换到 System shell 的功能正在开发中\n");
-            } else if (target.equals("root")) {
-                if (!usingRootShell) {
-                    switchToRootShell();
+            if (target.equals("root")) {
+                if (usingRootShell) {
+                    append("已经是 root shell\n");
                 } else {
-                    outputView.append("已经是 root shell\n");
+                    switchToRootShell();
                 }
+            } else if (target.equals("app") || target.equals("shell") || target.equals("system")) {
+                append("切换到 " + target + " 的功能正在开发中\n");
             } else {
-                outputView.append("用法: runin app|shell|system|root\n");
+                append("用法: runin app|shell|system|root\n");
             }
             return;
         }
-
         if (cmd.equals("exituser")) {
-            if (usingRootShell) {
-                JNIInterface.closeRootShell();
-                usingRootShell = false;
-                startShell();
-                outputView.append("已退出 root shell，返回普通 shell\n");
-            } else {
-                outputView.append("当前不是 root shell，无需退出\n");
+            if (!usingRootShell) {
+                append("当前不是 root shell，无需退出\n");
+                return;
             }
+            rootReaderRunning = false;
+            usingRootShell = false;
+            JNIInterface.closeRootShell();
+            inputEdit.setHint("$ ");
+            startShell();
             return;
         }
 
         if (usingRootShell) {
-            JNIInterface.writeRootShell(cmd + "\n");
-            String output = JNIInterface.readRootShell();
-            outputView.append((output != null && !output.isEmpty()) ? output + "\n" : "(命令无输出)\n");
+            // 输出由 root shell 读取线程负责，这里只写命令
+            if (JNIInterface.writeRootShell(cmd) < 0) {
+                append("写入 root shell 失败\n");
+            }
         } else {
             if (shellOutput == null) {
-                outputView.append("shell 未启动\n");
+                append("shell 未启动\n");
                 return;
             }
             try {
-                shellOutput.writeBytes(cmd + "\n");
+                shellOutput.write((cmd + "\n").getBytes(StandardCharsets.UTF_8));
                 shellOutput.flush();
-            } catch (Exception e) {
-                outputView.append("命令执行失败: " + e.getMessage() + "\n");
+            } catch (IOException e) {
+                append("命令执行失败: " + e.getMessage() + "\n");
             }
         }
     }
 
     private void switchToRootShell() {
+        int ret = JNIInterface.startRootShell();
+        if (ret != 0) {
+            if (ret == -2) {
+                append("当前进程不是 root（uid 未变成 0），无法启动 root shell\n");
+            } else {
+                append("root shell 启动失败，错误码 " + ret + "\n");
+            }
+            return;
+        }
+
+        if (shellProcess != null) {
+            shellProcess.destroy();
+            shellProcess = null;
+            shellOutput = null;
+        }
+        usingRootShell = true;
+        inputEdit.setHint("# ");
+        append("已切换到 root shell\n");
+        startRootReader();
+        JNIInterface.writeRootShell("id");
+    }
+
+    private void startRootReader() {
+        if (rootReaderRunning) return;
+        rootReaderRunning = true;
+        new Thread(() -> {
+            while (rootReaderRunning) {
+                if (!JNIInterface.isRootShellAvailable()) {
+                    // usingRootShell 已置 false 说明是 exituser 主动关闭，不用报错重建
+                    if (usingRootShell) {
+                        append("\n[root shell 已退出]\n");
+                        usingRootShell = false;
+                        inputEdit.post(() -> inputEdit.setHint("$ "));
+                        startShell();
+                    }
+                    break;
+                }
+                byte[] data = JNIInterface.readRootShellBytes();
+                if (data != null && data.length > 0) {
+                    append(new String(data, StandardCharsets.UTF_8));
+                } else {
+                    try {
+                        Thread.sleep(ROOT_POLL_INTERVAL_MS);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }
+            rootReaderRunning = false;
+        }).start();
+    }
+
+    /** Activity 回到前台时调用：漏洞提权成功后自动接上 root shell */
+    public void syncRootShell() {
+        if (!shutDown && !usingRootShell && JNIInterface.isRootShellAvailable()) {
+            switchToRootShell();
+        }
+    }
+
+    /** Activity 销毁时调用，释放普通 shell 进程（native root shell 保留给下次 attach） */
+    public void shutdown() {
+        shutDown = true;
+        rootReaderRunning = false;
         if (shellProcess != null) {
             shellProcess.destroy();
             shellProcess = null;
         }
-        usingRootShell = true;
-        inputEdit.setHint("# ");
-        outputView.append("切换到 root shell，您现在拥有 root 权限\n");
-        new Thread(() -> {
-            while (usingRootShell && JNIInterface.isRootShellAvailable()) {
-                String line = JNIInterface.readRootShell();
-                if (line != null && !line.isEmpty()) {
-                    final String finalLine = line;
-                    post(() -> outputView.append(finalLine + "\n"));
-                } else {
-                    try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-                }
-            }
-        }).start();
-        if (usingRootShell) {
-            JNIInterface.writeRootShell("whoami\n");
-            String output = JNIInterface.readRootShell();
-            if (output != null && output.contains("root")) {
-                outputView.append("Root shell 验证成功: " + output);
-            } else {
-                outputView.append("Root shell 验证失败，输出: " + (output != null ? output : "null") + "\n");
-                outputView.append("请检查漏洞是否正确提权\n");
-                usingRootShell = false;
-                startShell();
-            }
-        }
+        shellOutput = null;
+    }
+
+    private void append(final String text) {
+        if (shutDown) return;
+        post(() -> {
+            if (shutDown) return;
+            outputView.append(text);
+            scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
+        });
     }
 }
