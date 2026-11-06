@@ -24,12 +24,13 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
       
-    - name: Build Release APK
-      # 改为 assembleRelease，只编译 Release 版本，跳过耗时的测试
-      run: ./gradlew assembleRelease 
+    - name: Build Debug APK
+      # ⚠️ 关键修改：必须改为 assembleDebug，这样生成的 APK 会自动带上测试签名！
+      run: ./gradlew assembleDebug 
 
     - name: Upload APK as Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: app-release-apk
-        path: app/build/outputs/apk/release/*.apk
+        name: app-debug-apk
+        # ⚠️ 关键修改：路径也必须改为 debug 文件夹
+        path: app/build/outputs/apk/debug/*.apk
